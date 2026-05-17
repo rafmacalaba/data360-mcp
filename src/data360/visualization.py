@@ -590,11 +590,46 @@ async def get_viz_spec(
     BREAKDOWN_COMPARISON  | 1 breakdown, single year, ≤4 countries              | x=country(N), xOffset=breakdown(N), y=value(Q) (grouped bar)
     SMALL_MULTIPLES       | breakdown + >1 country, OR 2+ breakdowns            | facet=country(N), color=breakdown(N), x=year(temporal), y=value(Q)
     TEMPORAL_SINGLE*      | 1 breakdown (any dim), multi-year                   | x=year(temporal), y=value(Q), color=breakdown(N) (multi-series line)
+    HEATMAP               | >8 countries, multi-year, 0 breakdowns              | x=year(temporal), y=country(N), color=value(Q) (rect grid)
+    STACKED_AREA          | chart_type="area"/"stacked_area", composition Q     | x=year(temporal), y=value(Q) stacked, color=breakdown(N)
     FALLBACK_LINE         | unclassified shapes                                 | x=year(temporal), y=value(Q), color=country(N)
 
     *When comp_breakdown_1/2 has multiple values and year_count > 1, the pipeline routes
     to TEMPORAL_SINGLE with color=comp_breakdown_1 — producing one colored line per
     breakdown series. This is the correct encoding for WGI, sectoral breakdowns, etc.
+
+    ### High-cardinality and high-dimensionality guidance
+
+    DO NOT reduce country_code or disaggregation_filters to simplify the output.
+    The pipeline handles high-cardinality data automatically:
+
+    | Data shape                              | Pipeline action                              |
+    |-----------------------------------------|----------------------------------------------|
+    | >8 countries, multi-year, 0 breakdowns  | Auto-routes to HEATMAP (rect grid)           |
+    | >8 countries + breakdown                | SMALL_MULTIPLES, caps at 6 facets            |
+    | Single year, >8 countries               | DISTRIBUTION (strip chart), caps at 20 bars  |
+    | ≤8 countries + breakdown, multi-year    | TEMPORAL_SINGLE with colored lines per series|
+
+    If the LLM passes 3 countries when the user asked for all Sub-Saharan Africa,
+    the pipeline cannot recover the missing data — it will produce a misleading chart.
+    Always pass the full country list and let the pipeline decide the correct strategy.
+
+    ### Visual channel hierarchy (perception accuracy)
+
+    Channels are ranked by how accurately viewers read encoded values:
+
+    Channel           | Type        | Used for
+    ------------------|-------------|----------------------------------------
+    Position (x/y)    | Highest     | Quantitative values, time axis
+    Color (hue)       | Medium      | Nominal categories (country, breakdown)
+    Color (lightness) | Medium      | Quantitative gradient (heatmap cells)
+    Size              | Medium-low  | Not used in current strategies
+    Shape             | Low         | Not used in current strategies
+
+    The pipeline always maps `value` → position (y-axis) and `country`/`breakdown` → color
+    (hue). Do not override this — a chart that encodes values as colors (instead of y) is
+    strictly less readable, except in heatmaps where a 2D spatial grid makes position
+    unavailable for both axes simultaneously.
 
     ### Encoding type rules (Vega-Lite v5)
 
@@ -605,6 +640,8 @@ async def get_viz_spec(
     - Legend titles: derived from _TOOLTIP_SPECS labels (e.g. "Breakdown", not
       "Comp_Breakdown_1").
     - Color scale: WB categorical palette (9 colors). Gender data uses WB_GENDER_COLORS.
+    - Heatmap color scale: sequential ("yellowgreenblue") for positive-only data;
+      divergent ("redblue") when data contains negative values.
 
     Args:
         database_id: Database identifier (e.g., WB_HNP, WB_WDI).
@@ -620,7 +657,27 @@ async def get_viz_spec(
             and lets the pipeline choose the correct Vega-Lite channel automatically.
             For REF_AREA use comma-separated ISO codes (e.g. 'KEN,TZA');
             semicolons in REF_AREA are normalized to commas.
-        chart_type: Optional hint — "line", "bar", "scatter", "strip", "small_multiples".
+        chart_type: Optional hint — "line", "bar", "scatter", "strip", "small_multiples",
+            "area", "stacked_area".
+
+            ## chart_type decision rule
+
+            Only pass "area" or "stacked_area" when the user's question implies
+            **composition or share over time** — i.e., the series together add up to a
+            meaningful whole. Typical signal words: "breakdown of", "composition of",
+            "share of", "proportion", "what portion", "structure of".
+
+            CORRECT — user asked about composition:
+              chart_type="stacked_area"   # "Show the age group breakdown in Japan"
+              chart_type="area"           # "What is the composition of electricity by source?"
+
+            WRONG — user asked about a trend:
+              chart_type="area"           # "How has GDP changed in Africa?"   ← use default
+              chart_type="stacked_area"   # "What is the trend of poverty?"    ← use default
+
+            For trend questions ("how has X changed?", "show the evolution of Y"), omit
+            chart_type entirely and let the pipeline choose the correct strategy
+            (line chart, heatmap, etc.) based on data shape.
         relevant_fields: Optional list of column names to include in the chart.
         custom_constraints: Optional list of raw Draco ASP constraints.
         use_default_constraints: If True (default), apply standard encoding heuristics.
@@ -629,33 +686,94 @@ async def get_viz_spec(
         Dict with "url" (chart URL on success), "error" (message on failure),
         and optionally "warning" (if fallback was used).
     """
-    from data360.api import get_data_api_url, get_metadata
+    from data360.api import get_data_api_url, get_disaggregation, get_metadata
 
-    # 1. Build URL
-    try:
-        data_url = await get_data_api_url(
-            database_id=database_id,
-            indicator_id=indicator_id,
-            country_code=country_code,
-            start_year=start_year,
-            end_year=end_year,
-            disaggregation_filters=disaggregation_filters,
-        )
-    except ValueError as e:
-        return _err(f"Error: {e}")
+    # ── Detect "expand" dimensions ─────────────────────────────────────────────
+    # If the caller passes disaggregation_filters={"SEX": None}, it means
+    # "fetch all values for SEX". The Data360 API only accepts a single scalar
+    # per dimension, so a None value is our internal sentinel for "expand me".
+    # We resolve the valid non-trivial codes via get_disaggregation, then fire
+    # one fetch per value concurrently and concat the results.
+    _TRIVIAL_CODES = {"_T", "_Z"}
+    expand_dims: dict[str, list[str]] = {}  # dim → [valid non-trivial codes]
+    if disaggregation_filters:
+        for dim, val in disaggregation_filters.items():
+            if val is None:
+                try:
+                    disagg = await get_disaggregation(database_id, indicator_id)
+                    for d in (disagg.get("dimensions") or []):
+                        if d.get("field_name", "").upper() == dim.upper():
+                            codes = [
+                                c for c in (d.get("field_value") or [])
+                                if c not in _TRIVIAL_CODES
+                            ]
+                            if codes:
+                                expand_dims[dim] = codes
+                            break
+                except Exception as e:
+                    _logger.warning(f"Could not resolve expand dim {dim}: {e}")
 
-    # 2. Fetch data
-    try:
-        data = await _fetch_data_internal(data_url)
-    except ValueError as e:
-        return _err(f"Error: {e}")
-    except httpx.HTTPStatusError as e:
-        return _err(f"Error fetching data: {e.response.status_code}")
-    except Exception as e:
-        _logger.exception("Failed to fetch data")
-        return _err(f"Error fetching data: {e}")
+    # ── Fetch ──────────────────────────────────────────────────────────────────
+    if expand_dims:
+        # Build one filter dict per value combination (only handles single expand dim for now).
+        # Multi-dim expansion (e.g. SEX × AGE) would be a combinatorial explosion — skip it.
+        first_dim, codes = next(iter(expand_dims.items()))
+        base_filters = {
+            k: v for k, v in (disaggregation_filters or {}).items()
+            if k != first_dim
+        }
 
-    data.columns = [c.lower() for c in data.columns]
+        async def _fetch_one(code: str) -> pd.DataFrame:
+            filters = {**base_filters, first_dim: code}
+            try:
+                url = await get_data_api_url(
+                    database_id=database_id,
+                    indicator_id=indicator_id,
+                    country_code=country_code,
+                    start_year=start_year,
+                    end_year=end_year,
+                    disaggregation_filters=filters,
+                )
+                df = await _fetch_data_internal(url)
+                df.columns = [c.lower() for c in df.columns]
+                return df
+            except Exception as e:
+                _logger.warning(f"Expand fetch failed for {first_dim}={code}: {e}")
+                return pd.DataFrame()
+
+        frames = await asyncio.gather(*[_fetch_one(c) for c in codes])
+        non_empty = [f for f in frames if not f.empty]
+        if not non_empty:
+            return _err("Error: No data returned for any disaggregation value.")
+        data = pd.concat(non_empty, ignore_index=True)
+        # data.columns already lowercased inside _fetch_one
+    else:
+        # 1. Build URL
+        try:
+            data_url = await get_data_api_url(
+                database_id=database_id,
+                indicator_id=indicator_id,
+                country_code=country_code,
+                start_year=start_year,
+                end_year=end_year,
+                disaggregation_filters=disaggregation_filters,
+            )
+        except ValueError as e:
+            return _err(f"Error: {e}")
+
+        # 2. Fetch data
+        try:
+            data = await _fetch_data_internal(data_url)
+        except ValueError as e:
+            return _err(f"Error: {e}")
+        except httpx.HTTPStatusError as e:
+            return _err(f"Error fetching data: {e.response.status_code}")
+        except Exception as e:
+            _logger.exception("Failed to fetch data")
+            return _err(f"Error fetching data: {e}")
+
+        data.columns = [c.lower() for c in data.columns]
+
 
     # 3. Detect frequency
     data_frequency = None
@@ -740,9 +858,14 @@ async def get_viz_spec(
     # 6. Map country codes
     viz_data = await _map_country_codes(viz_data)
 
+    import textwrap
+
+    # Apply text wrapping (Typography T3 constraint) so long single-indicator titles don't overflow
+    wrapped_title = textwrap.wrap(chart_title, width=80) if isinstance(chart_title, str) else chart_title
+
     # Vega-Lite title + subtitle (geography, year range, unit) after data is cleaned
     chart_title_vl: str | dict = viz_config.build_chart_title_with_context(
-        chart_title, raw_unit or None, viz_data
+        wrapped_title, raw_unit or None, viz_data
     )
 
     # 7. Determine strategy — route around Draco for complex patterns
@@ -766,6 +889,8 @@ async def get_viz_spec(
         viz_config.ChartStrategy.CROSS_SECTIONAL,
         viz_config.ChartStrategy.BREAKDOWN_COMPARISON,
         viz_config.ChartStrategy.SMALL_MULTIPLES,
+        viz_config.ChartStrategy.HEATMAP,
+        viz_config.ChartStrategy.STACKED_AREA,
         viz_config.ChartStrategy.TEMPORAL_SINGLE,
         viz_config.ChartStrategy.FALLBACK_LINE,
     }
@@ -991,6 +1116,29 @@ async def get_multi_indicator_viz_spec(
     CORRELATION           | 2 indicators, >1 country, single year               | x=indicator1(Q), y=indicator2(Q), color=country(N) (scatter)
     CORRELATION_TEMPORAL  | 2 indicators, >1 country, multi-year                | x=indicator1(Q), y=indicator2(Q), color=country(N), order=year (connected scatter)
     TEMPORAL_MULTI_IND    | 2-4 indicators, 1 country or 3+ indicators          | layered lines, independent y-scales per indicator
+    STACKED_AREA          | chart_type="area"/"stacked_area", composition Q     | x=year(temporal), y=value(Q) stacked, color=indicator(N)
+
+    ### High-cardinality guidance
+
+    DO NOT reduce indicator_ids or disaggregation_filters to simplify the output.
+    Pass the full set of indicators the user asked about. The pipeline will:
+    - Merge all indicator series into a single aligned DataFrame
+    - Auto-select the correct strategy (scatter, layered lines, stacked area)
+    - Cap series count if needed and annotate the subtitle with a trim note
+
+    ### Visual channel hierarchy (perception accuracy)
+
+    Channels are ranked by how accurately viewers read encoded values:
+
+    Channel           | Type        | Used for
+    ------------------|-------------|----------------------------------------
+    Position (x/y)    | Highest     | Quantitative values, time axis
+    Color (hue)       | Medium      | Nominal categories (country, indicator)
+    Color (lightness) | Medium      | Not used for multi-indicator charts
+    Size / Shape      | Low         | Not used in current strategies
+
+    The pipeline always maps quantitative values → position (y-axis) and nominal
+    categories → color (hue). Do not override this with custom disaggregation_filters.
 
     ### Encoding type rules (Vega-Lite v5)
 
@@ -1018,7 +1166,25 @@ async def get_multi_indicator_viz_spec(
             and lets the pipeline choose the correct Vega-Lite channel automatically.
             REF_AREA uses comma-separated ISO codes (semicolons normalized to commas).
         chart_type: Optional hint — "scatter", "connected_scatter", "layered_lines",
-            "line", "bar". If omitted, auto-selected by data shape.
+            "line", "bar", "area", "stacked_area". If omitted, auto-selected by data shape.
+
+            ## chart_type decision rule
+
+            Only pass "area" or "stacked_area" when the user's question implies
+            **composition or share over time** — i.e., the multiple indicators together
+            add up to a meaningful whole (e.g., age groups summing to total population,
+            electricity sources summing to total generation).
+            Typical signal words: "breakdown of", "composition of", "share of",
+            "proportion", "structure of".
+
+            CORRECT — user asked about composition across multiple indicators:
+              chart_type="stacked_area"   # "Show the age group breakdown in Japan"
+
+            WRONG — user asked about a trend:
+              chart_type="area"           # "How has GDP and poverty changed?" ← use default
+
+            For trend or comparison questions, omit chart_type and let the pipeline
+            select the correct strategy (layered lines, scatter, etc.).
 
     Returns:
         Dict with "url" (chart URL on success), "error" (on failure),
@@ -1140,11 +1306,18 @@ async def get_multi_indicator_viz_spec(
 
     merged = _sanitize_dataframe_for_json_records(merged)
 
+    import textwrap
+
     # 5. Build chart title (with subtitle when all indicators share the same unit)
+    # GoG / AntVis guideline: Do not arbitrarily truncate strings with ellipses.
+    # Instead, preserve the full text but word-wrap it so it fits the chart width.
     if len(titles) == 2:
-        chart_title = f"{titles[0]} vs. {titles[1]}"
+        full_title = f"{titles[0]} vs. {titles[1]}"
     else:
-        chart_title = " | ".join(titles)
+        full_title = " | ".join(titles)
+
+    # Wrap at 80 characters to ensure it fits safely within standard chart widths
+    chart_title = textwrap.wrap(full_title, width=80)
 
     unique_units = list(dict.fromkeys(u for u in units if u))
     shared_unit = unique_units[0] if len(unique_units) == 1 else ""
@@ -1169,11 +1342,55 @@ async def get_multi_indicator_viz_spec(
         f"Multi-indicator strategy: {strategy_result.strategy.value} — {strategy_result.reason}"
     )
 
+    # 7b. Reshape for stacked area: melt wide → long
+    # build_stacked_area_spec expects a DataFrame with a single "value" column and a
+    # "indicator" color column, not the wide merged layout produced by the join above.
+    spec_df = merged
+    if strategy_result.strategy == viz_config.ChartStrategy.STACKED_AREA:
+        id_cols = [c for c in merged.columns if c not in indicator_col_names]
+        spec_df = merged.melt(
+            id_vars=id_cols,
+            value_vars=indicator_col_names,
+            var_name="indicator",
+            value_name="value",
+        )
+        # Map internal slugified column names back to human-readable indicator titles
+        slug_to_title = dict(zip(indicator_col_names, titles))
+        spec_df["indicator"] = spec_df["indicator"].map(slug_to_title)
+        spec_df = spec_df.dropna(subset=["value"])
+        # Propagate the color_dim so the builder picks up the indicator column
+        strategy_result = viz_config.StrategyResult(
+            viz_config.ChartStrategy.STACKED_AREA,
+            strategy_result.reason,
+            indicator_cols=strategy_result.indicator_cols,
+            color_dim="indicator",
+        )
+
+    # 7c. Reshape for grouped bar (multi-indicator path): melt wide → long.
+    # build_breakdown_comparison_spec expects df["value"] + df[color_dim].
+    # When color_dim="indicator" the wide merged frame must be melted so each
+    # (country, indicator) pair becomes a row with a single "value" and an
+    # "indicator" label column used as the xOffset grouping key.
+    elif (
+        strategy_result.strategy == viz_config.ChartStrategy.BREAKDOWN_COMPARISON
+        and strategy_result.color_dim == "indicator"
+    ):
+        id_cols = [c for c in merged.columns if c not in indicator_col_names]
+        spec_df = merged.melt(
+            id_vars=id_cols,
+            value_vars=indicator_col_names,
+            var_name="indicator",
+            value_name="value",
+        )
+        slug_to_title = dict(zip(indicator_col_names, titles))
+        spec_df["indicator"] = spec_df["indicator"].map(slug_to_title)
+        spec_df = spec_df.dropna(subset=["value"])
+
     # 8. Build spec
     try:
         spec = viz_config.dispatch_spec(
             strategy_result.strategy,
-            merged,
+            spec_df,
             chart_title_vl,
             strategy_result,
             indicator_labels=indicator_labels,
